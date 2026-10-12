@@ -25,9 +25,37 @@ export async function generateChatResponse({
   });
 
   const response = await llmClient.chat.completions.create({
-    model:env.llm.model,
+    model: env.llm.model,
     messages,
   });
 
   return response.choices[0]?.message?.content ?? "";
+}
+
+export async function streamChatResponse({
+  prompt,
+  systemPrompt,
+}: {
+  prompt: string;
+  systemPrompt?: string;
+}) {
+  const messages = [];
+
+  if (systemPrompt) {
+    messages.push({
+      role: "system" as const,
+      content: systemPrompt,
+    });
+  }
+
+  messages.push({
+    role: "user" as const,
+    content: prompt,
+  });
+
+  return llmClient.chat.completions.create({
+    model: env.llm.model,
+    messages,
+    stream: true,
+  });
 }
