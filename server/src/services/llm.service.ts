@@ -35,9 +35,11 @@ export async function generateChatResponse({
 export async function streamChatResponse({
   prompt,
   systemPrompt,
+  signal,
 }: {
   prompt: string;
   systemPrompt?: string;
+  signal?: AbortSignal;
 }) {
   const messages = [];
 
@@ -53,9 +55,12 @@ export async function streamChatResponse({
     content: prompt,
   });
 
-  return llmClient.chat.completions.create({
-    model: env.llm.model,
-    messages,
-    stream: true,
-  });
+  return llmClient.chat.completions.create(
+    {
+      model: env.llm.model,
+      messages,
+      stream: true,
+    },
+    { signal },
+  );
 }

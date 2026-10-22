@@ -168,6 +168,14 @@ export async function streamChatResponse({
       }
     }
   } finally {
+    if (!completed) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The stream may already be aborted or closed.
+      }
+    }
+
     reader.releaseLock();
   }
 }

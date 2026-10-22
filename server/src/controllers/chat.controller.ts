@@ -4,6 +4,55 @@ import {
   streamChatResponse,
 } from "../services/llm.service.js";
 
+type StreamEvent =
+  | { type: "delta"; text: string }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+function writeSse(res: Response, event: StreamEvent): Promise<boolean> {
+  if (res.destroyed || res.writableEnded) {
+    return Promise.resolve(false);
+  }
+
+  const canContinue = res.write(`data: ${JSON.stringify(event)}\n\n`);
+
+  if (canContinue) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      res.off("error", onError);
+    };
+
+    const onDrain = () => {
+      cleanup();
+      resolve(true);
+    };
+
+    const onClose = () => {
+      cleanup();
+      resolve(false);
+    };
+
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    res.once("error", onError);
+
+    // The connection may have closed just before listeners were attached.
+    if (res.destroyed || res.writableEnded) {
+      onClose();
+    }
+  });
+}
+
 export async function chatController(
   req: Request,
   res: Response,
@@ -63,6 +112,16 @@ export async function streamChat(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  const upstreamController = new AbortController();
+  let clientDisconnected = false;
+
+  const handleClientDisconnect = () => {
+    if (!res.writableEnded) {
+      clientDisconnected = true;
+      upstreamController.abort();
+    }
+  };
+
   // Tell the browser that this response is an SSE stream.
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -73,44 +132,81 @@ export async function streamChat(req: Request, res: Response): Promise<void> {
   // Send the headers immediately instead of waiting for the first chunk.
   res.flushHeaders();
 
+  //when the controller recevies the abort signal
+  res.on("close", handleClientDisconnect);
+
   try {
     const stream = await streamChatResponse({
       prompt: prompt.trim(),
       systemPrompt,
+      signal: upstreamController.signal,
     });
 
     for await (const chunk of stream) {
+      if (
+        clientDisconnected ||
+        upstreamController.signal.aborted ||
+        res.destroyed
+      ) {
+        break;
+      }
+
       const text = chunk.choices[0]?.delta?.content;
 
-      // Some chunks contain metadata rather than text.
-      if (typeof text === "string" && text.length > 0) {
-        res.write(
-          `data: ${JSON.stringify({
-            type: "delta",
-            text,
-          })}\n\n`,
-        );
+      if (typeof text !== "string" || text.length === 0) {
+        continue;
+      }
+
+      const canContinue = await writeSse(res, {
+        type: "delta",
+        text,
+      });
+
+      if (!canContinue) {
+        clientDisconnected = true;
+        upstreamController.abort();
+        break;
       }
     }
 
-    // Explicitly tell the client that generation is complete.
-    if (!res.destroyed) {
-      res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
-      res.end();
+    if (
+      !clientDisconnected &&
+      !upstreamController.signal.aborted &&
+      !res.destroyed
+    ) {
+      const canContinue = await writeSse(res, { type: "done" });
+
+      if (canContinue && !res.destroyed && !res.writableEnded) {
+        res.end();
+      }
     }
   } catch (error) {
-    // Keep provider details in server logs, not in the public response.
-    console.error("LLM streaming failed:", error);
+    if (
+      !clientDisconnected &&
+      !upstreamController.signal.aborted &&
+      !res.destroyed &&
+      !res.writableEnded
+    ) {
+      console.error("LLM streaming failed:", error);
 
-    // Once headers are sent, we cannot switch to an ordinary JSON error.
-    if (!res.destroyed && !res.writableEnded) {
-      res.write(
-        `data: ${JSON.stringify({
+      try {
+        await writeSse(res, {
           type: "error",
           message: "The LLM response could not be completed.",
-        })}\n\n`,
-      );
-      res.end();
+        });
+      } catch (writeError) {
+        console.error("Failed to write streaming error:", writeError);
+      }
+
+      if (!res.destroyed && !res.writableEnded) {
+        res.end();
+      }
+    }
+  } finally {
+    res.off("close", handleClientDisconnect);
+
+    if (clientDisconnected && !upstreamController.signal.aborted) {
+      upstreamController.abort();
     }
   }
 }
